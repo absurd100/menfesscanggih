@@ -378,7 +378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_text = template.replace("{TEXT}", text_with_sosmed).replace("{SENDER}", sender)
         
         bot_me = await context.bot.get_me()
-        footer_bot = f"\n🤖 <i>dikirim via</i> <a href='https://t.me/{bot_me.username}'>{html.escape(bot_me.first_name)}</a>"
+        footer_bot = f"\n🤖 <i>dikirim via</i> <a href='https://t.me/{bot_me.username}?start=help'>{html.escape(bot_me.first_name)}</a>"
         
         final_caption = base_text + footer_bot
         
