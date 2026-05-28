@@ -6,9 +6,9 @@ from telegram.constants import ParseMode
 # ==========================================
 # 1. KONFIGURASI UTAMA & VARIABEL GLOBAL
 # ==========================================
-TOKEN = os.getenv("BOT_TOKEN", '8859761355:AAFkIG7fTi5h3Cr7AhlY9g1Z77BMDjiQD-U')
-DEFAULT_CHANNEL = os.getenv("CH_ID", '-1003411380148') 
-MAIN_OWNER_ID = 8562224386
+TOKEN = os.getenv("BOT_TOKEN", 'isi')
+DEFAULT_CHANNEL = os.getenv("CH_ID", 'isi') 
+MAIN_OWNER_ID = isi
 OWNER_ID = int(os.getenv("OWN_ID", MAIN_OWNER_ID))
 
 IS_CLONE = os.getenv("IS_CLONE", "False") == "True"
