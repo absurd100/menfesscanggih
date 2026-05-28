@@ -69,11 +69,11 @@ def is_banned(uid):
     return str(uid) in load_json(BAN_FILE)
 
 # ==========================================
-# 4. REGEX & LINK PARSER (VERSI KUAT)
+# 4. REGEX & LINK PARSER (VERSI KUAT & LENGKAP)
 # ==========================================
 def parse_and_extract_links(raw_text):
-    # Regex ini mendeteksi awalan http, https, www, atau langsung nama domain sosmed
-    url_pattern = r'((?:https?://|www\.)[^\s]+|(?:instagram\.com|facebook\.com|fb\.com|fb\.watch|fb\.gg|twitter\.com|x\.com|tiktok\.com|vt\.tiktok\.com|youtube\.com|youtu\.be)[^\s]*)'
+    # 1. Master regex untuk mendeteksi segala jenis link (http, https, www, atau domain sosmed populer langsung)
+    url_pattern = r'((?:https?://|www\.)[^\s]+|(?:instagram\.com|facebook\.com|fb\.com|fb\.watch|fb\.gg|twitter\.com|x\.com|tiktok\.com|vt\.tiktok\.com|youtube\.com|youtu\.be|threads\.net|linkedin\.com|pinterest\.com|pin\.it|snapchat\.com|twitch\.tv|discord\.gg|discord\.com|reddit\.com|t\.me|telegram\.me|wa\.me|spotify\.com|soundcloud\.com|github\.com|medium\.com)[^\s]*)'
     
     urls = re.findall(url_pattern, raw_text, re.IGNORECASE)
     
@@ -82,16 +82,31 @@ def parse_and_extract_links(raw_text):
         clean_text = clean_text.replace(u, '')
     clean_text = re.sub(r'\s+', ' ', clean_text).strip()
     
+    # 2. Pemetaan kategori media sosial jaman sekarang secara spesifik
     categories = {
         "facebook": r'facebook\.com|fb\.com|fb\.watch|fb\.gg',
         "instagram": r'instagram\.com|ig\.me',
         "x (twitter)": r'twitter\.com|x\.com',
         "tiktok": r'tiktok\.com|vt\.tiktok\.com',
-        "youtube": r'youtube\.com|youtu\.be'
+        "youtube": r'youtube\.com|youtu\.be',
+        "threads": r'threads\.net',
+        "linkedin": r'linkedin\.com',
+        "pinterest": r'pinterest\.com|pin\.it',
+        "snapchat": r'snapchat\.com',
+        "twitch": r'twitch\.tv',
+        "discord": r'discord\.gg|discord\.com',
+        "reddit": r'reddit\.com',
+        "telegram": r't\.me|telegram\.me',
+        "whatsapp": r'wa\.me|api\.whatsapp\.com',
+        "spotify": r'spotify\.com',
+        "soundcloud": r'soundcloud\.com',
+        "github": r'github\.com',
+        "medium": r'medium\.com'
     }
     
     grouped = {}
     for url in urls:
+        # Memastikan skema URL selalu diawali https:// agar hyperlink aktif saat diklik
         href = url if url.startswith('http') else 'https://' + url
         matched = False
         for cat, pattern in categories.items():
@@ -99,8 +114,10 @@ def parse_and_extract_links(raw_text):
                 grouped.setdefault(cat, []).append(href)
                 matched = True
                 break
+        
+        # Jika link tidak terdeteksi oleh daftar kategori sosmed di atas, gunakan nama "link sosmed"
         if not matched:
-            grouped.setdefault("link", []).append(href)
+            grouped.setdefault("link sosmed", []).append(href)
             
     sosmed_text = ""
     if grouped:
@@ -108,8 +125,9 @@ def parse_and_extract_links(raw_text):
         links_list = []
         for cat, links in grouped.items():
             for i, href in enumerate(links):
+                # Format: Jika link sejenis > 1 maka diberi penomoran (contoh: tiktok 1, tiktok 2)
                 label = cat if len(links) == 1 else f"{cat} {i+1}"
-                links_list.append(f"<a href='{href}'>{label}</a>")
+                links_list.append(f"🔗 <a href='{href}'>{label}</a>")
         sosmed_text += "\n".join(links_list)
         
     return clean_text, sosmed_text
