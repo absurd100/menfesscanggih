@@ -1,0 +1,796 @@
+import os
+import sys
+import json
+import re
+import html
+import time
+import signal
+import asyncio
+import logging
+import sqlite3
+import subprocess
+import urllib.request
+import urllib.parse
+from datetime import datetime, UTC
+from pyrogram import Client, filters
+from pyrogram.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ==========================================
+# 1. KONFIGURASI UTAMA & VARIABEL GLOBAL
+# ==========================================
+API_ID = 31339570  
+API_HASH = "1f14c1c891126b5bcd0800b94822c821"  
+TOKEN = os.getenv("BOT_TOKEN", "isi_token_master_di_sini")
+
+DEFAULT_CHANNEL = os.getenv("CH_ID", "-1001234567890")  
+MAIN_OWNER_ID = 123456789  # GANTI DENGAN ID ANDA
+OWNER_ID = int(os.getenv("OWN_ID", MAIN_OWNER_ID))
+
+IS_CLONE = os.getenv("IS_CLONE", "False") == "True"
+NAMA_BOT = "Bilik Rahasia Menfess"
+DEFAULT_TEMPLATE = "===================================\n{TEXT}\n\n===================================\n😎 <i>sender</i>: {SENDER}"
+
+expiry_timers = {}
+
+# ==========================================
+# 2. DATABASE INITIALIZATION (SQLite)
+# ==========================================
+DB_FILE = "menfess_universe.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            gender TEXT,
+            mode TEXT DEFAULT 'all',
+            anon INTEGER DEFAULT 1,
+            pinned_msg INTEGER DEFAULT 0,
+            kuota INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_config (
+            bot_id INTEGER PRIMARY KEY,
+            target_channel TEXT,
+            qris_link TEXT DEFAULT '',
+            post_template TEXT,
+            gratis INTEGER DEFAULT 0
+        )
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS banned_users (id INTEGER PRIMARY KEY)")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS posts (
+            msg_id INTEGER,
+            bot_id INTEGER,
+            sender_id INTEGER,
+            dashboard_msg_id INTEGER,
+            r1 INTEGER DEFAULT 0,
+            r2 INTEGER DEFAULT 0,
+            r3 INTEGER DEFAULT 0,
+            r4 INTEGER DEFAULT 0,
+            r5 INTEGER DEFAULT 0,
+            PRIMARY KEY (msg_id, bot_id)
+        )
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS clones (token TEXT PRIMARY KEY, owner INTEGER, ch TEXT, pid INTEGER)")
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def db_query(query, params=(), commit=False, fetch="all"):
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query, params)
+        if commit:
+            conn.commit()
+            return cursor.lastrowid
+        if fetch == "all":
+            return cursor.fetchall()
+        elif fetch == "one":
+            return cursor.fetchone()
+    except Exception as e:
+        logging.error(f"Database Error: {e}")
+    finally:
+        conn.close()
+
+# Helper async untuk update lintas bot via HTTP API (Mencegah eror beda Client Session)
+async def remote_edit_message(bot_token, chat_id, message_id, text):
+    def _send():
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
+            data = urllib.parse.urlencode({"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": "HTML"}).encode("utf-8")
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                return response.read()
+        except Exception as e:
+            logging.error(f"Remote Edit Failed: {e}")
+            return None
+    return await asyncio.to_thread(_send)
+
+# ==========================================
+# 3. WORKER TIMER (AUTO DELETE)
+# ==========================================
+async def auto_delete_worker(client, chat_id, message_id, key):
+    while True:
+        sisa_waktu = expiry_timers.get(key, 0) - time.time()
+        if sisa_waktu <= 0:
+            break
+        await asyncio.sleep(min(sisa_waktu, 10))
+    try:
+        await client.delete_messages(chat_id, message_id)
+    except:
+        pass
+    expiry_timers.pop(key, None)
+
+# ==========================================
+# 4. SISTEM KEYBOARD UNIVERSAL (UI)
+# ==========================================
+def kb_pilih_gender():
+    return ReplyKeyboardMarkup([["Laki-laki", "Perempuan"]], resize_keyboard=True)
+
+def kb_home(user_id, bot_id):
+    is_owner = (user_id == MAIN_OWNER_ID and not IS_CLONE) or (user_id == OWNER_ID)
+    if is_owner:
+        cfg = db_query("SELECT gratis FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+        status_gratis = cfg["gratis"] if cfg else 0
+        txt_mode = "🔓 Mode: GRATIS (Klik Ke Berbayar)" if status_gratis else "🔒 Mode: BERBAYAR (Klik Ke Gratis)"
+        return ReplyKeyboardMarkup([
+            ['📝 POSTING', '🤖 Buat/Kelola Clone'],
+            ['⚙️ Pengaturan', '📢 Broadcast'],
+            [txt_mode],
+            ['👤 Mode User']
+        ], resize_keyboard=True)
+    else:
+        return ReplyKeyboardMarkup([
+            ['📝 POSTING', '🤖 Buat/Kelola Clone'],
+            ['💳 Isi Kuota', '📊 Info Akun']
+        ], resize_keyboard=True)
+
+def kb_posting_menu():
+    return ReplyKeyboardMarkup([
+        ['👤 Kirim Anonim', '👁️ Tampilkan Nama'],
+        ['🎧 Pengaturan Menyimak', '⚧ Ubah Gender'],
+        ['🏠 HOME']
+    ], resize_keyboard=True)
+
+def kb_menyimak_filter():
+    return ReplyKeyboardMarkup([
+        ["Terima Semua Jenis (Teks & Media)"],
+        ["Terima Media Saja (Foto/Video)", "Terima Teks Saja"],
+        ["🏠 HOME"]
+    ], resize_keyboard=True)
+
+def rating_kb(msg_id, sent_msg_id, origin_bot_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("1⭐", callback_data=f"rate_1_{msg_id}_{sent_msg_id}_{origin_bot_id}"),
+         InlineKeyboardButton("2⭐", callback_data=f"rate_2_{msg_id}_{sent_msg_id}_{origin_bot_id}"),
+         InlineKeyboardButton("3⭐", callback_data=f"rate_3_{msg_id}_{sent_msg_id}_{origin_bot_id}")],
+        [InlineKeyboardButton("4⭐", callback_data=f"rate_4_{msg_id}_{sent_msg_id}_{origin_bot_id}"),
+         InlineKeyboardButton("5⭐", callback_data=f"rate_5_{msg_id}_{sent_msg_id}_{origin_bot_id}")]
+    ])
+
+# ==========================================
+# 5. REGEX & LINK PARSER
+# ==========================================
+def parse_and_extract_links(raw_text):
+    url_pattern = r'((?:https?://|www\.)[^\s]+|(?:instagram\.com|facebook\.com|fb\.com|fb\.watch|fb\.gg|twitter\.com|x\.com|tiktok\.com|vt\.tiktok\.com|youtube\.com|youtu\.be|threads\.net|linkedin\.com|pinterest\.com|pin\.it|snapchat\.com|twitch\.tv|discord\.gg|discord\.com|reddit\.com|t\.me|telegram\.me|wa\.me|spotify\.com|soundcloud\.com|github\.com|medium\.com)[^\s]*)'
+    urls = re.findall(url_pattern, raw_text, re.IGNORECASE)
+    clean_text = raw_text
+    for u in urls:
+        clean_text = clean_text.replace(u, '')
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+
+    categories = {
+        "facebook": r'facebook\.com|fb\.com|fb\.watch|fb\.gg',
+        "instagram": r'instagram\.com|ig\.me',
+        "x (twitter)": r'twitter\.com|x\.com',
+        "tiktok": r'tiktok\.com|vt\.tiktok\.com',
+        "youtube": r'youtube\.com|youtu\.be',
+        "threads": r'threads\.net',
+        "linkedin": r'linkedin\.com',
+        "pinterest": r'pinterest\.com|pin\.it',
+        "snapchat": r'snapchat\.com',
+        "twitch": r'twitch\.tv',
+        "discord": r'discord\.gg|discord\.com',
+        "reddit": r'reddit\.com',
+        "telegram": r't\.me|telegram\.me',
+        "whatsapp": r'wa\.me|api\.whatsapp\.com',
+        "spotify": r'spotify\.com',
+        "soundcloud": r'soundcloud\.com',
+        "github": r'github\.com',
+        "medium": r'medium\.com'
+    }
+
+    grouped = {}
+    for url in urls:
+        href = url if url.startswith('http') else 'https://' + url
+        matched = False
+        for cat, pattern in categories.items():
+            if re.search(pattern, url, re.IGNORECASE):
+                grouped.setdefault(cat, []).append(href)
+                matched = True
+                break
+        if not matched:
+            grouped.setdefault("link sosmed", []).append(href)
+
+    sosmed_text = ""
+    if grouped:
+        sosmed_text += "\n\n"
+        links_list = []
+        for cat, links in grouped.items():
+            for i, href in enumerate(links):
+                label = cat if len(links) == 1 else f"{cat} {i+1}"
+                links_list.append(f"🔗 <a href='{href}'>{label}</a>")
+        sosmed_text += "\n".join(links_list)
+
+    return clean_text, sosmed_text
+
+# ==========================================
+# 6. INSTANCE APP PYROGRAM (SESSION DINAMIS)
+# ==========================================
+SESSION_NAME = f"session_{TOKEN[-8:]}"
+app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=TOKEN)
+
+async def get_bot_id(client):
+    if not hasattr(client, "me_id"):
+        me = await client.get_me()
+        client.me_id = me.id
+        client.me_username = me.username
+        client.me_name = me.first_name
+    return client.me_id
+
+# ==========================================
+# 7. ROUTING PERINTAH & ACTIONS
+# ==========================================
+@app.on_message(filters.command("start") & filters.private)
+async def cmd_start(client, message):
+    user_id = message.from_user.id
+    if db_query("SELECT id FROM banned_users WHERE id = ?", (user_id,), fetch="one"): return
+
+    user_exist = db_query("SELECT id FROM users WHERE id = ?", (user_id,), fetch="one")
+    if not user_exist:
+        db_query("INSERT INTO users (id, kuota) VALUES (?, 0)", (user_id,), commit=True)
+
+    teks_start = (f"👋 **Selamat datang di {NAMA_BOT}!**\n\n"
+                  "Platform Menfess & Bilik Rahasia antar lawan jenis.\n"
+                  "🔒 Konten aman, anti-save & anti-forward (`protect_content`).\n"
+                  "⏳ Pesan hancur dalam 1 Jam, bisa diperpanjang via Rating.\n\n"
+                  "Silakan tentukan atau ubah identitas gender Anda untuk masuk:")
+    await message.reply(teks_start, reply_markup=kb_pilih_gender())
+
+@app.on_message(filters.private & (filters.text | filters.photo | filters.video))
+async def handle_core_messages(client, message):
+    user_id = message.from_user.id
+    bot_id = await get_bot_id(client)
+    text = message.text if message.text else ""
+
+    if db_query("SELECT id FROM banned_users WHERE id = ?", (user_id,), fetch="one"): return
+
+    cfg_exist = db_query("SELECT bot_id FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+    if not cfg_exist:
+        db_query("INSERT INTO bot_config (bot_id, target_channel, post_template, gratis) VALUES (?, ?, ?, 0)",
+                 (bot_id, DEFAULT_CHANNEL, DEFAULT_TEMPLATE), commit=True)
+
+    if text in ["Laki-laki", "Perempuan"]:
+        gender_val = "pria" if text == "Laki-laki" else "wanita"
+        old_data = db_query("SELECT pinned_msg FROM users WHERE id = ?", (user_id,), fetch="one")
+        if old_data and old_data["pinned_msg"] != 0:
+            try: await client.delete_messages(user_id, old_data["pinned_msg"])
+            except: pass
+
+        pesan_pin = (f"📌 Status Identitas: **{text.upper()}**\n"
+                     f"**MODE STANDBY {client.me_name.upper()} AKTIF**\n\n"
+                     "Halaman bersih. Anda sekarang berada di halaman HOME dan siap menerima sebaran pesan lawan jenis sesuai kriteria.")
+        
+        pin_msg = await message.reply(pesan_pin, reply_markup=kb_home(user_id, bot_id))
+        try: await pin_msg.pin(disable_notification=True)
+        except: pass
+
+        db_query("UPDATE users SET gender = ?, pinned_msg = ? WHERE id = ?", (gender_val, pin_msg.id, user_id), commit=True)
+        if not hasattr(client, "user_status_mem"): client.user_status_mem = {}
+        client.user_status_mem[user_id] = None
+        return
+
+    if text == "🏠 HOME":
+        user_info = db_query("SELECT gender FROM users WHERE id = ?", (user_id,), fetch="one")
+        if not user_info or not user_info["gender"]:
+            return await message.reply("Tentukan gender terlebih dahulu:", reply_markup=kb_pilih_gender())
+        
+        if not hasattr(client, "user_status_mem"): client.user_status_mem = {}
+        client.user_status_mem[user_id] = None
+        return await message.reply("Kembali ke Halaman Utama (HOME):", reply_markup=kb_home(user_id, bot_id))
+
+    if text == '📝 POSTING':
+        return await message.reply("Menu Posting Menfess & Bilik Rahasia. Pilih opsi:", reply_markup=kb_posting_menu())
+
+    if text in ['👤 Kirim Anonim', '👁️ Tampilkan Nama']:
+        mode_val = 1 if text == '👤 Kirim Anonim' else 0
+        db_query("UPDATE users SET anon = ? WHERE id = ?", (mode_val, user_id), commit=True)
+        
+        if not hasattr(client, "user_status_mem"): client.user_status_mem = {}
+        client.user_status_mem[user_id] = "WAITING_MENFESS"
+        return await message.reply("✍ **Silakan kirimkan menfess Anda sekarang.**\n(Teks / Foto / Video)", 
+                                   reply_markup=ReplyKeyboardMarkup([['🏠 HOME']], resize_keyboard=True))
+
+    if text == '🎧 Pengaturan Menyimak':
+        return await message.reply("Jenis konten apa yang ingin Anda terima di DM dari lawan jenis?", reply_markup=kb_menyimak_filter())
+
+    if text in ["Terima Semua Jenis (Teks & Media)", "Terima Media Saja (Foto/Video)", "Terima Teks Saja"]:
+        mode_val = "all" if text == "Terima Semua Jenis (Teks & Media)" else ("media" if text == "Terima Media Saja (Foto/Video)" else "teks")
+        db_query("UPDATE users SET mode = ? WHERE id = ?", (mode_val, user_id), commit=True)
+        return await message.reply("✅ Kriteria filter menyimak berhasil disimpan!", reply_markup=kb_posting_menu())
+
+    if text == '⚧ Ubah Gender':
+        return await message.reply("Silakan set ulang identitas gender Anda:", reply_markup=kb_pilih_gender())
+
+    if text == '📊 Info Akun':
+        u_data = db_query("SELECT kuota FROM users WHERE id = ?", (user_id,), fetch="one")
+        c_data = db_query("SELECT gratis FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+        kuota_saat_ini = u_data["kuota"] if u_data else 0
+        bot_mode = "Gratis" if (c_data and c_data["gratis"] == 1) else "Berbayar"
+        return await message.reply(f"📊 **INFO AKUN ANDA**\n\n🆔 User ID: `{user_id}`\n💎 Sisa Kuota: **{kuota_saat_ini}**\n⚙️ Aturan Bot: **{bot_mode}**", reply_markup=kb_home(user_id, bot_id))
+
+    if text == '💳 Isi Kuota':
+        c_data = db_query("SELECT qris_link FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+        qris = c_data["qris_link"] if c_data else ""
+        txt_instruksi = "💳 **Silakan transfer dan kirimkan Foto Bukti Pembayaran Anda langsung ke bot ini.**"
+        if qris and qris != "Belum disetel":
+            try:
+                await client.send_photo(chat_id=user_id, photo=qris, caption=txt_instruksi)
+                return
+            except: pass
+        return await message.reply(txt_instruksi)
+
+    if not hasattr(client, "user_status_mem"): client.user_status_mem = {}
+    current_status = client.user_status_mem.get(user_id)
+
+    if message.photo and user_id != OWNER_ID and current_status != "WAITING_MENFESS":
+        kb_confirm = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➖", callback_data=f"cnt_{user_id}_4"),
+             InlineKeyboardButton("💎 5", callback_data="none"),
+             InlineKeyboardButton("➕", callback_data=f"cnt_{user_id}_6")],
+            [InlineKeyboardButton("✅ KONFIRMASI", callback_data=f"acc_{user_id}_5")]
+        ])
+        await client.send_photo(
+            chat_id=OWNER_ID,
+            photo=message.photo.file_id,
+            caption=f"💳 **BUKTI TRANSFERS MASUK**\n\n👤 User: {html.escape(message.from_user.first_name)}\n🆔 ID: `{user_id}`",
+            reply_markup=kb_confirm
+        )
+        return await message.reply("✅ **Bukti pembayaran telah terkirim ke Admin.** Mohon tunggu proses validasi.")
+
+    is_owner_privilege = (user_id == MAIN_OWNER_ID and not IS_CLONE) or (user_id == OWNER_ID)
+    if is_owner_privilege:
+        if text == '⚙️ Pengaturan':
+            cfg = db_query("SELECT target_channel, qris_link FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+            ch_target = cfg["target_channel"] if cfg else DEFAULT_CHANNEL
+            qr_target = cfg["qris_link"] if cfg else "Belum disetel"
+            
+            kb_set = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📝 Edit Template", callback_data="set_tpl"),
+                 InlineKeyboardButton("📢 Edit Target Channel", callback_data="set_ch")],
+                [InlineKeyboardButton("🖼️ Edit Link QRIS", callback_data="set_qris")]
+            ])
+            return await message.reply(
+                f"⚙️ **PENGATURAN ENGINE**\n\n"
+                f"📢 **ID Target Channel:** `{ch_target}`\n"
+                f"🖼️ **Link QRIS Asset:** `{qr_target}`",
+                reply_markup=kb_set
+            )
+
+        if text.startswith("🔓 Mode: GRATIS") or text.startswith("🔒 Mode: BERBAYAR"):
+            cfg = db_query("SELECT gratis FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+            now_gratis = cfg["gratis"] if cfg else 0
+            new_gratis = 0 if now_gratis == 1 else 1
+            db_query("UPDATE bot_config SET gratis = ? WHERE bot_id = ?", (new_gratis, bot_id), commit=True)
+            
+            str_alert = "Diubah menjadi Mode GRATIS!" if new_gratis else "Diubah menjadi Mode BERBAYAR!"
+            await message.reply(f"✅ {str_alert}")
+            return await message.reply("Menu Utama Diperbarui:", reply_markup=kb_home(user_id, bot_id))
+
+        if text == '📢 Broadcast':
+            client.user_status_mem[user_id] = "WAITING_BC"
+            return await message.reply("📢 **Silakan ketik / kirim materi broadcast Anda:**", reply_markup=ReplyKeyboardMarkup([['🏠 HOME']], resize_keyboard=True))
+
+        if text == '👤 Mode User':
+            return await message.reply("Berpindah ke tampilan User biasa.", 
+                                       reply_markup=ReplyKeyboardMarkup([['📝 POSTING', '🤖 Buat/Kelola Clone'], ['💳 Isi Kuota', '📊 Info Akun']], resize_keyboard=True))
+
+    if is_owner_privilege and current_status == "WAITING_BC":
+        client.user_status_mem[user_id] = None
+        all_users = db_query("SELECT id FROM users")
+        await message.reply("⏳ Memulai pemrosesan kiriman massal (Broadcast)...")
+        bc_count = 0
+        for u in all_users:
+            try:
+                if message.photo:
+                    await client.send_photo(chat_id=u["id"], photo=message.photo.file_id, caption=f"📢 **INFO ADMIN**\n\n{message.caption or ''}")
+                elif message.video:
+                    await client.send_video(chat_id=u["id"], video=message.video.file_id, caption=f"📢 **INFO ADMIN**\n\n{message.caption or ''}")
+                else:
+                    await client.send_message(chat_id=u["id"], text=f"📢 **INFO ADMIN**\n\n{message.text}")
+                bc_count += 1
+                await asyncio.sleep(0.05)
+            except: continue
+        return await message.reply(f"✅ Broadcast Selesai! Ditargetkan ke {bc_count} user.", reply_markup=kb_home(user_id, bot_id))
+
+    if is_owner_privilege and current_status in ["EDIT_TPL", "EDIT_CH", "EDIT_QRIS"]:
+        client.user_status_mem[user_id] = None
+        if current_status == "EDIT_TPL":
+            db_query("UPDATE bot_config SET post_template = ? WHERE bot_id = ?", (text, bot_id), commit=True)
+            await message.reply("✅ Template postingan berhasil diperbarui!")
+        elif current_status == "EDIT_CH":
+            db_query("UPDATE bot_config SET target_channel = ? WHERE bot_id = ?", (text.strip(), bot_id), commit=True)
+            await message.reply(f"✅ Target channel ID berhasil diubah menjadi: `{text.strip()}`")
+        elif current_status == "EDIT_QRIS":
+            db_query("UPDATE bot_config SET qris_link = ? WHERE bot_id = ?", (text.strip(), bot_id), commit=True)
+            await message.reply("✅ Tautan media QRIS berhasil diperbarui!")
+        return
+
+    if text == '🤖 Buat/Kelola Clone':
+        client.user_status_mem[user_id] = "WAITING_TOKEN_CLONE"
+        clones = db_query("SELECT * FROM clones")
+        kb_list = []
+        for c in clones:
+            if user_id == MAIN_OWNER_ID:
+                kb_list.append([InlineKeyboardButton(f"🛑 Kill Clone {c['token'][:8]}... (PID: {c['pid']})", callback_data=f"kill_{c['token'][-8:]}")])
+            elif c["owner"] == user_id:
+                kb_list.append([InlineKeyboardButton(f"🛑 Matikan Clone Saya ({c['token'][:8]}...)", callback_data=f"kill_{c['token'][-8:]}")])
+                
+        guide_txt = ("🤖 **PANEL CLONING ENGINE SYSTEM**\n\n"
+                     "1. Buat bot baru di @BotFather lalu copy Tokennya.\n"
+                     "2. **Kirim / Paste token** tersebut kesine sekarang untuk menghidupkan clone engine Anda.")
+        if kb_list:
+            await message.reply("📋 **Daftar Engine Clone Aktif Saat Ini:**", reply_markup=InlineKeyboardMarkup(kb_list))
+        return await message.reply(guide_txt, reply_markup=ReplyKeyboardMarkup([['🏠 HOME']], resize_keyboard=True))
+
+    if current_status == "WAITING_TOKEN_CLONE":
+        clean_token = text.strip()
+        if ":" not in clean_token or len(clean_token) < 25:
+            return await message.reply("❌ Format token BotFather tidak sah! Silakan kirim ulang token yang valid.")
+        
+        client.user_status_mem[user_id] = None
+        await message.reply("⏳ Menginisiasi core engine sub-process server clone...")
+        
+        try:
+            env = os.environ.copy()
+            env["BOT_TOKEN"] = clean_token
+            env["IS_CLONE"] = "True"
+            env["OWN_ID"] = str(user_id)
+            
+            cfg_mst = db_query("SELECT target_channel FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+            ch_current = cfg_mst["target_channel"] if cfg_mst else DEFAULT_CHANNEL
+            env["CH_ID"] = str(ch_current)
+            
+            script_path = os.path.abspath(sys.argv[0])
+            proc = subprocess.Popen([sys.executable, script_path], env=env)
+            
+            db_query("INSERT OR REPLACE INTO clones (token, owner, ch, pid) VALUES (?, ?, ?, ?)",
+                     (clean_token, user_id, str(ch_current), proc.pid), commit=True)
+            
+            return await message.reply(f"✅ **Bot Clone Berhasil Diaktifkan!**\n⚡ PID Engine: `{proc.pid}`", reply_markup=kb_home(user_id, bot_id))
+        except Exception as e:
+            return await message.reply(f"❌ Gagal meluncurkan clone: {e}", reply_markup=kb_home(user_id, bot_id))
+
+    # ==========================================
+    # 8. UTAMA CORE : PEMROSESAN MENFESS & SEBARAN
+    # ==========================================
+    if current_status == "WAITING_MENFESS":
+        u_info = db_query("SELECT gender, anon, kuota FROM users WHERE id = ?", (user_id,), fetch="one")
+        if not u_info or not u_info["gender"]:
+            client.user_status_mem[user_id] = None
+            return await message.reply("Aksi dibatalkan. Anda belum memilih gender.", reply_markup=kb_pilih_gender())
+
+        cfg = db_query("SELECT target_channel, post_template, gratis FROM bot_config WHERE bot_id = ?", (bot_id,), fetch="one")
+        target_channel = cfg["target_channel"] if cfg else DEFAULT_CHANNEL
+        post_template = cfg["post_template"] if cfg else DEFAULT_TEMPLATE
+        is_gratis = cfg["gratis"] if cfg else 0
+
+        if user_id != OWNER_ID and not is_gratis and u_info["kuota"] <= 0:
+            client.user_status_mem[user_id] = None
+            return await message.reply("❌ **Kuota kiriman Anda telah habis!**", reply_markup=kb_home(user_id, bot_id))
+
+        raw_input_text = message.text or message.caption or ""
+        clean_txt, sosmed_txt = parse_and_extract_links(raw_input_text)
+        
+        sender_format = "anonim" if u_info["anon"] == 1 else f"<a href='tg://user?id={user_id}'>{html.escape(message.from_user.first_name)}</a>"
+        formatted_body = f"<i>{html.escape(clean_txt)}</i>" if clean_txt else ""
+        text_with_links = formatted_body + sosmed_txt
+
+        bot_link_html = f"<a href='https://t.me/{client.me_username}'>{html.escape(client.me_name)}</a>"
+        final_channel_caption = post_template.replace("{TEXT}", text_with_links).replace("{SENDER}", sender_format) + f"\n🤖 <i>dikirim via {bot_link_html}</i>"
+
+        target_channel_id = int(target_channel) if str(target_channel).lstrip('-').isdigit() else target_channel
+        snt_msg = None
+        try:
+            if message.photo:
+                snt_msg = await client.send_photo(chat_id=target_channel_id, photo=message.photo.file_id, caption=final_channel_caption)
+            elif message.video:
+                snt_msg = await client.send_video(chat_id=target_channel_id, video=message.video.file_id, caption=final_channel_caption)
+            else:
+                snt_msg = await client.send_message(chat_id=target_channel_id, text=final_channel_caption)
+        except Exception as e:
+            client.user_status_mem[user_id] = None
+            return await message.reply(f"❌ Gagal mengirim ke channel target: {e}", reply_markup=kb_home(user_id, bot_id))
+
+        if user_id != OWNER_ID and not is_gratis:
+            db_query("UPDATE users SET kuota = MAX(0, kuota - 1) WHERE id = ?", (user_id,), commit=True)
+
+        ch_raw_str = str(target_channel_id).replace("-100", "")
+        link_url = f"https://t.me/c/{ch_raw_str}/{snt_msg.id}"
+        kb_to_channel = InlineKeyboardMarkup([[InlineKeyboardButton("Lihat Postingan Channel ↗️", url=link_url)]])
+        
+        dashboard_text = (f"🎉 **Menfess Berhasil Terkirim Secara Global!**\n\n"
+                          f"📊 **LAPORAN RATING KONTEN ANDA**\n"
+                          f"🕒 _Menunggu rating masuk dari lawan jenis..._\n\n"
+                          f"⭐ 1: 0x | ⭐ 2: 0x | ⭐ 3: 0x\n⭐ 4: 0x | ⭐ 5: 0x")
+        dash_msg = await message.reply(dashboard_text, reply_markup=kb_to_channel)
+
+        log_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚫 BAN USER", callback_data=f"ban_{user_id}"),
+             InlineKeyboardButton("🔓 UNBAN USER", callback_data=f"unban_{user_id}")]
+        ])
+        log_caption = f"📩 **LOG MENFESS MASUK**\n\n👤 Pengirim: {html.escape(message.from_user.first_name)} (`{user_id}`)\n📝 **Isi Asli:**\n{html.escape(raw_input_text)}"
+        try:
+            if message.photo: await client.send_photo(chat_id=OWNER_ID, photo=message.photo.file_id, caption=log_caption, reply_markup=log_kb)
+            elif message.video: await client.send_video(chat_id=OWNER_ID, video=message.video.file_id, caption=log_caption, reply_markup=log_kb)
+            else: await client.send_message(chat_id=OWNER_ID, text=log_caption, reply_markup=log_kb)
+        except: pass
+
+        db_query("INSERT OR REPLACE INTO posts (msg_id, bot_id, sender_id, dashboard_msg_id) VALUES (?, ?, ?, ?)",
+                 (message.id, bot_id, user_id, dash_msg.id), commit=True)
+
+        # SEBARAN GLOBAL LINTAS BOT
+        target_gender = "wanita" if u_info["gender"] == "pria" else "pria"
+        listeners = db_query("SELECT id, mode FROM users WHERE gender = ?", (target_gender,))
+        is_input_media = True if (message.photo or message.video) else False
+
+        for target in listeners:
+            t_id, t_mode = target["id"], target["mode"]
+            if t_id in [MAIN_OWNER_ID, OWNER_ID]: continue
+            if t_mode == "media" and not is_input_media: continue
+            if t_mode == "teks" and is_input_media: continue
+
+            try:
+                kb_view = InlineKeyboardMarkup([[InlineKeyboardButton("👀 Buka Pesan Rahasia", callback_data=f"view_{message.id}_{user_id}_{bot_id}")]])
+                noti = await client.send_message(
+                    chat_id=t_id,
+                    text="📬 **Ada pesan rahasia baru dari lawan jenis!**\n_Ketuk tombol di bawah untuk membacanya._",
+                    reply_markup=kb_view,
+                    protect_content=True
+                )
+                n_key = f"{t_id}_{noti.id}"
+                expiry_timers[n_key] = time.time() + 3600
+                asyncio.create_task(auto_delete_worker(client, t_id, noti.id, n_key))
+            except: 
+                pass
+
+        client.user_status_mem[user_id] = None
+        await message.reply("Kembali ke Halaman Menu Utama:", reply_markup=kb_home(user_id, bot_id))
+        return
+
+    if not text.startswith('/'):
+        await message.reply("💡 Sila gunakan tombol menu keyboard di bawah untuk berinteraksi dengan sistem bot.", reply_markup=kb_home(user_id, bot_id))
+
+# ==========================================
+# 9. CALLBACK INLINE HANDLER
+# ==========================================
+@app.on_callback_query()
+async def global_callback_handler(client, query):
+    user_id = query.from_user.id
+    bot_id = await get_bot_id(client)
+    data = query.data
+
+    if data.startswith("ban_") or data.startswith("unban_"):
+        if user_id != OWNER_ID:
+            return await query.answer("Akses Ditolak! Anda bukan admin bot ini.", show_alert=True)
+        
+        target_uid = int(data.split("_")[1])
+        if data.startswith("ban_"):
+            db_query("INSERT OR IGNORE INTO banned_users (id) VALUES (?)", (target_uid,), commit=True)
+            status_text = "\n\n🚫 **STATUS SENDER: BANNED**"
+        else:
+            db_query("DELETE FROM banned_users WHERE id = ?", (target_uid,), commit=True)
+            status_text = "\n\n✅ **STATUS SENDER: AKTIF**"
+
+        try:
+            def strip_status(t):
+                return t.replace("\n\n🚫 **STATUS SENDER: BANNED**", "").replace("\n\n✅ **STATUS SENDER: AKTIF**", "")
+            if query.message.photo or query.message.video:
+                orig = strip_status(query.message.caption or "")
+                await query.edit_message_caption(caption=orig + status_text, reply_markup=query.message.reply_markup)
+            else:
+                orig = strip_status(query.message.text or "")
+                await query.edit_message_text(text=orig + status_text, reply_markup=query.message.reply_markup)
+            await query.answer("Status Akses User Berhasil Diupdate!")
+        except Exception as e:
+            await query.answer(f"Gagal: {e}", show_alert=True)
+
+    elif data.startswith("cnt_"):
+        if user_id != OWNER_ID: return
+        _, target_id, current_val = data.split("_")
+        val = max(1, int(current_val))
+        kb_change = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➖", callback_data=f"cnt_{target_id}_{val-1}"),
+             InlineKeyboardButton(f"💎 {val}", callback_data="none"),
+             InlineKeyboardButton("➕", callback_data=f"cnt_{target_id}_{val+1}")],
+            [InlineKeyboardButton("✅ KONFIRMASI KUOTA", callback_data=f"acc_{target_id}_{val}")]
+        ])
+        await query.edit_message_reply_markup(reply_markup=kb_change)
+
+    elif data.startswith("acc_"):
+        if user_id != OWNER_ID: return
+        _, target_id, add_val = data.split("_")
+        db_query("UPDATE users SET kuota = kuota + ? WHERE id = ?", (int(add_val), int(target_id)), commit=True)
+        try:
+            if query.message.photo or query.message.video:
+                await query.edit_message_caption(caption=(query.message.caption or "") + f"\n\n✅ **SUKSES DITAMBAHKAN +{add_val} KUOTA**")
+            else:
+                await query.edit_message_text(text=(query.message.text or "") + f"\n\n✅ **SUKSES DITAMBAHKAN +{add_val} KUOTA**")
+        except: pass
+        try: await client.send_message(chat_id=int(target_id), text=f"🎉 **Top Up Berhasil!**\n`+{add_val}` kuota pengiriman baru telah ditambahkan.")
+        except: pass
+        await query.answer("Kuota sukses dikirim!")
+
+    elif data.startswith("set_"):
+        if user_id != OWNER_ID: return
+        cmd = data.split("_")[1]
+        if not hasattr(client, "user_status_mem"): client.user_status_mem = {}
+        if cmd == "tpl":
+            client.user_status_mem[user_id] = "EDIT_TPL"
+            await query.message.reply_text("📝 **Kirimkan template baru Anda.** (Harus ada `{TEXT}` dan `{SENDER}`)")
+        elif cmd == "ch":
+            client.user_status_mem[user_id] = "EDIT_CH"
+            await query.message.reply_text("📢 **Kirimkan ID Channel target baru Anda.** Contoh: `-1003755410515`")
+        elif cmd == "qris":
+            client.user_status_mem[user_id] = "EDIT_QRIS"
+            await query.message.reply_text("🖼 **Kirimkan tautan link media QRIS baru Anda:**")
+        await query.answer()
+
+    elif data.startswith("kill_"):
+        target_suffix_token = data.split("_")[1]
+        clone_data = db_query("SELECT * FROM clones")
+        target_clone = None
+        for c in clone_data:
+            if c["token"].endswith(target_suffix_token):
+                target_clone = c
+                break
+        if target_clone:
+            if user_id != MAIN_OWNER_ID and target_clone["owner"] != user_id:
+                return await query.answer("❌ Akses ditolak!", show_alert=True)
+            db_query("DELETE FROM clones WHERE token = ?", (target_clone["token"],), commit=True)
+            try:
+                os.kill(int(target_clone["pid"]), signal.SIGTERM)
+                kill_msg = "Engine dihentikan."
+            except:
+                kill_msg = "Engine sudah tidak aktif."
+            await query.edit_message_text(f"✅ **Bot Clone Sukses Dihapus!**\n⚡ Status: {kill_msg}")
+        else:
+            await query.answer("Data tidak ditemukan!", show_alert=True)
+
+    elif data.startswith("view_"):
+        _, target_msg_id, sender_id, origin_bot_id = data.split("_")
+        target_msg_id, sender_id, origin_bot_id = int(target_msg_id), int(sender_id), int(origin_bot_id)
+
+        n_key = f"{user_id}_{query.message.id}"
+        expiry_timers[n_key] = 0
+        try: await query.message.delete()
+        except: pass
+
+        try:
+            sender_db = db_query("SELECT anon FROM users WHERE id = ?", (sender_id,), fetch="one")
+            is_anon = sender_db["anon"] if sender_db else 1
+            
+            # AMBIL DATA DARI BOT ASAL: Jika bot aktif berbeda dengan bot asal, 
+            # gunakan token bot asal dari DB/Env agar pesan ter-load dengan benar.
+            source_token = TOKEN
+            if origin_bot_id != bot_id:
+                cl_token = db_query("SELECT token FROM clones")
+                for c in cl_token:
+                    if ":" in c["token"] and int(c["token"].split(":")[0]) == origin_bot_id:
+                        source_token = c["token"]
+                        break
+                        
+            # Ambil via salinan pesan aman
+            msg = await client.get_messages(chat_id=sender_id, message_ids=target_msg_id)
+            sender_name_txt = ""
+            if is_anon == 0:
+                sender_user_profile = await client.get_users(sender_id)
+                sender_name_txt = f"\n\n📢 _Dikirim oleh: {sender_user_profile.first_name}_"
+
+            panduan_waktu = "\n\n⏱ **Info:** _Pesan hancur dalam 1 Jam. Berikan rating bintang untuk memperpanjang durasi (+1⭐ = +1 Jam)._"
+
+            if msg.media:
+                caption_build = (msg.caption or "") + sender_name_txt + panduan_waktu
+                if msg.photo: sent = await client.send_photo(chat_id=user_id, photo=msg.photo.file_id, caption=caption_build, has_spoiler=True, protect_content=True)
+                elif msg.video: sent = await client.send_video(chat_id=user_id, video=msg.video.file_id, caption=caption_build, has_spoiler=True, protect_content=True)
+                else: sent = await msg.copy(chat_id=user_id, protect_content=True)
+            else:
+                teks_build = (msg.text or "") + sender_name_txt + panduan_waktu
+                sent = await client.send_message(chat_id=user_id, text=teks_build, protect_content=True)
+
+            await sent.edit_reply_markup(reply_markup=rating_kb(target_msg_id, sent.id, origin_bot_id))
+            timer_key = f"{user_id}_{sent.id}"
+            expiry_timers[timer_key] = time.time() + 3600
+            asyncio.create_task(auto_delete_worker(client, user_id, sent.id, timer_key))
+        except Exception as e:
+            await client.send_message(chat_id=user_id, text="❌ Maaf, pesan rahasia gagal dimuat atau telah dihapus.")
+
+    # ==========================================
+    # SINKRONISASI INTERAKTIF TOTAL LINTAS BOT
+    # ==========================================
+    elif data.startswith("rate_"):
+        _, star_rate, msg_id, sent_msg_id, origin_bot_id = data.split("_")
+        star_rate, msg_id, sent_msg_id, origin_bot_id = int(star_rate), int(msg_id), int(sent_msg_id), int(origin_bot_id)
+
+        timer_key = f"{user_id}_{sent_msg_id}"
+        if timer_key in expiry_timers:
+            expiry_timers[timer_key] += (star_rate * 3600)
+            waktu_hapus_timestamp = expiry_timers[timer_key]
+            jam_hapus = datetime.fromtimestamp(waktu_hapus_timestamp + (7 * 3600), UTC).strftime('%H:%M')
+        else:
+            jam_hapus = "N/A"
+
+        kb_voted = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ {star_rate} Bintang | Dihapus {jam_hapus} WIB", callback_data="none")]])
+        try: await query.message.edit_reply_markup(reply_markup=kb_voted)
+        except: pass
+        
+        await query.answer(f"Terima kasih! Durasi diperpanjang {star_rate} Jam. Hilang pukul {jam_hapus} WIB.", show_alert=True)
+
+        # 1. Update counter tabel global database terpusat
+        db_query(f"UPDATE posts SET r{star_rate} = r{star_rate} + 1 WHERE msg_id = ? AND bot_id = ?", (msg_id, origin_bot_id), commit=True)
+        
+        # 2. Tarik akumulasi stat rating terbaru
+        stats = db_query("SELECT sender_id, dashboard_msg_id, r1, r2, r3, r4, r5 FROM posts WHERE msg_id = ? AND bot_id = ?", (msg_id, origin_bot_id), fetch="one")
+        if stats and stats["dashboard_msg_id"]:
+            report = (f"🎉 **Menfess Berhasil Terkirim Secara Global!**\n\n"
+                      f"📊 **LAPORAN RATING KONTEN ANDA**\n\n"
+                      f"⭐ 1: {stats['r1']}x | ⭐ 2: {stats['r2']}x | ⭐ 3: {stats['r3']}x\n"
+                      f"⭐ 4: {stats['r4']}x | ⭐ 5: {stats['r5']}x")
+            
+            # 3. Cari Token Bot Asal pengirim Menfess untuk eksekusi Edit Post Dashboard Lintas Bot tanpa eror session
+            target_bot_token = TOKEN
+            if origin_bot_id != bot_id:
+                clones_db = db_query("SELECT token FROM clones")
+                for cl in clones_db:
+                    if ":" in cl["token"] and int(cl["token"].split(":")[0]) == origin_bot_id:
+                        target_bot_token = cl["token"]
+                        break
+            
+            # Eksekusi update dashboard panel pengirim via HTTP request asynchronous lintas bot
+            asyncio.create_task(remote_edit_message(target_bot_token, stats["sender_id"], stats["dashboard_msg_id"], report))
+
+# ==========================================
+# 10. RUNNING ENGINE & AUTO-BOOT CLONES SYSTEM
+# ==========================================
+def main():
+    if not IS_CLONE:
+        active_clones = db_query("SELECT * FROM clones")
+        for c in active_clones:
+            try:
+                env = os.environ.copy()
+                env["BOT_TOKEN"] = c["token"]
+                env["CH_ID"] = str(c["ch"])
+                env["OWN_ID"] = str(c["owner"])
+                env["IS_CLONE"] = "True"
+                
+                script_path = os.path.abspath(sys.argv[0])
+                proc = subprocess.Popen([sys.executable, script_path], env=env)
+                db_query("UPDATE clones SET pid = ? WHERE token = ?", (proc.pid, c["token"]), commit=True)
+                logging.info(f"Auto-Boot Clone {c['token'][:8]}... Berhasil. PID: {proc.pid}")
+            except Exception as e:
+                logging.error(f"Gagal auto-boot clone: {e}")
+
+    logging.info(f"=== Menjalankan Core Engine: {'CLONE_BOT' if IS_CLONE else 'MASTER_BOT'} ===")
+    app.run()
+
+if __name__ == '__main__':
+    main()
